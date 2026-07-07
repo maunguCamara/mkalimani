@@ -38,12 +38,22 @@ EVAL_FRACTION = 0.05
 
 # Dialects we care about (KenTrans file name substrings → dialect tag)
 DIALECT_MAP = {
+    "bukusu": "lubukusu",
+    "tachoni": "lutachobi",
     "marachi": "lumarachi",
-    "lumarachi": "lumarachi",
-    "logooli": "lulogooli",
-    "logooli": "lulogooli",
-    "lulogooli": "lulogooli",
     "maragoli": "lulogooli",
+    "banyore": "lunyole",
+    "kisa": "oluShisa",
+    "marama": "oluMarama",
+    "tsotso": "oluTsotso",
+    "wanga": "luwanga",
+    "nyala":"lunyala",
+    "idakho": "luidakho",
+    "isukha": "luisukha",
+    "tiriki": "ludiriji",
+    "samia": "lusamia",
+    "khayo": "lukhayo",
+    "kabras": "lukabras", 
 }
 
 SUPPORTED_DIALECTS = {"lumarachi", "lulogooli"}   # exclude lubukusu for this run
