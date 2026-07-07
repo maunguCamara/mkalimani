@@ -47,7 +47,7 @@ BLEU + chrF++ on the held-out eval split, with same sample output printed
 Upload to hub
 Push dataset to Huggingface and generate a model card with scores filled.
 
-For slef-contibuted pairs, focus on speech domains under represented in the Bible corpus, like market speech, family vocabulary, food, numbers.
+For self-contibuted pairs, focus on speech domains under represented in the Bible corpus, like market speech, family vocabulary, food, numbers.
 # 1. Get data from Harvard Dataverse + place Bible files
 # 2. Add your pairs to data/contributed/
 
