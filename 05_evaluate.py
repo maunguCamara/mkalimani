@@ -1,12 +1,16 @@
 """
-05_evaluate.py
-==============
-Evaluate the trained Luhya TranslateGemma model.
-Outputs BLEU, chrF++, eval loss — same metrics as Kikuyu V7.
+05_evaluate_asr.py
+==================
+Luhya / Gusii ASR — Evaluation script
+
+Metrics:
+  WER  (Word Error Rate)      — primary metric, lower is better
+  CER  (Character Error Rate) — more fine-grained, useful for agglutinative langs
+  eval_loss + perplexity      — from trainer_state.json (same logic as translation model)
 
 Usage:
-    python scripts/05_evaluate.py --model-dir training/final_lora
-    python scripts/05_evaluate.py --model-id yourname/luhya_translategemma_4b_v1
+    python scripts/05_evaluate_asr.py --lang luhya --model-dir training/luhya/final
+    python scripts/05_evaluate_asr.py --lang gusii --model-id yourname/gusii_whisper_small_v1
 """
 
 import json
@@ -15,44 +19,19 @@ import argparse
 from pathlib import Path
 
 
-def load_eval_pairs(eval_file: str) -> list[dict]:
-    pairs = []
-    with open(eval_file, encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                pairs.append(json.loads(line))
-    return pairs
-
-
-# ── eval_loss extraction ────────────────────────────────────────────────────
+# ── eval_loss from checkpoint (shared logic with translation model) ───────────
 def parse_eval_loss(checkpoint_dir: str | None) -> dict:
     """
-    Extract eval_loss (and derived perplexity) from TRL/Transformers training artefacts.
-
-    Looks in order:
-      1. trainer_state.json  — written by Trainer every eval step; contains the
-         full log history including {"eval_loss": ..., "step": ...} entries.
-      2. all_results.json    — written by trainer.evaluate() if called explicitly.
-      3. train_results.json  — may include a final eval pass.
-
-    Returns a dict with:
-      best_eval_loss     — lowest eval_loss observed across all steps
-      final_eval_loss    — eval_loss at the last logged eval step
-      best_step          — training step where best_eval_loss was achieved
-      perplexity         — exp(best_eval_loss); lower is better
-      eval_loss_history  — list of {"step", "eval_loss"} for plotting
-      source             — which file the data came from
+    Extract eval_loss and perplexity from TRL/Transformers trainer_state.json.
+    Falls back to all_results.json or train_results.json.
     """
     if not checkpoint_dir:
         return {}
 
     cdir = Path(checkpoint_dir)
-    result: dict = {}
 
-    # ── 1. trainer_state.json (most complete source) ──
     state_path = cdir / "trainer_state.json"
     if not state_path.exists():
-        # Also check inside checkpoint subdirs (e.g. checkpoint-500/)
         for sub in sorted(cdir.glob("checkpoint-*")):
             candidate = sub / "trainer_state.json"
             if candidate.exists():
@@ -64,15 +43,13 @@ def parse_eval_loss(checkpoint_dir: str | None) -> dict:
         log_history = state.get("log_history", [])
 
         eval_entries = [
-            {"step": entry["step"], "eval_loss": entry["eval_loss"]}
-            for entry in log_history
-            if "eval_loss" in entry
+            {"step": e["step"], "eval_loss": e["eval_loss"]}
+            for e in log_history if "eval_loss" in e
         ]
-
         if eval_entries:
-            best = min(eval_entries, key=lambda x: x["eval_loss"])
+            best  = min(eval_entries, key=lambda x: x["eval_loss"])
             final = eval_entries[-1]
-            result = {
+            return {
                 "best_eval_loss":    round(best["eval_loss"], 6),
                 "final_eval_loss":   round(final["eval_loss"], 6),
                 "best_step":         best["step"],
@@ -80,192 +57,212 @@ def parse_eval_loss(checkpoint_dir: str | None) -> dict:
                 "eval_loss_history": eval_entries,
                 "source":            str(state_path),
             }
-            return result
 
-    # ── 2. all_results.json ──
     for fname in ("all_results.json", "train_results.json"):
         fpath = cdir / fname
         if fpath.exists():
             data = json.loads(fpath.read_text(encoding="utf-8"))
             if "eval_loss" in data:
                 loss = data["eval_loss"]
-                result = {
+                return {
                     "best_eval_loss":  round(loss, 6),
                     "final_eval_loss": round(loss, 6),
                     "perplexity":      round(math.exp(loss), 4),
                     "source":          str(fpath),
                 }
-                return result
 
-    # ── 3. Nothing found ──
-    return {"eval_loss_note": f"No eval_loss found in {cdir}. Ensure eval_strategy != 'no'."}
+    return {"eval_loss_note": f"No eval_loss found in {cdir}"}
 
 
+# ── WER / CER ────────────────────────────────────────────────────────────────
+def compute_wer_cer(predictions: list[str], references: list[str]) -> dict:
+    import evaluate
+    wer_metric = evaluate.load("wer")
+    cer_metric = evaluate.load("cer")
+
+    # Normalise: lowercase + strip (consistent with training preprocessing)
+    preds_norm = [p.lower().strip() for p in predictions]
+    refs_norm  = [r.lower().strip() for r in references]
+
+    wer = wer_metric.compute(predictions=preds_norm, references=refs_norm)
+    cer = cer_metric.compute(predictions=preds_norm, references=refs_norm)
+
+    return {
+        "WER": round(wer * 100, 2),   # percentage
+        "CER": round(cer * 100, 2),
+    }
+
+
+# ── main evaluation ───────────────────────────────────────────────────────────
 def run_evaluation(
     model_dir_or_id: str,
-    eval_file: str,
+    manifest_path: str,
     output_file: str,
-    n_samples: int = None,
-    src_lang: str = "en",
-    tgt_lang: str = "luy",
     checkpoint_dir: str = None,
+    n_samples: int = None,
+    lang: str = "luhya",
 ):
     import torch
-    from unsloth import FastLanguageModel
-    import sacrebleu
+    import soundfile as sf
+    import librosa
+    from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
-    print(f"\n=== Luhya TranslateGemma — Evaluation ===")
-    print(f"  Model : {model_dir_or_id}")
-    print(f"  Eval  : {eval_file}")
+    print(f"\n=== {lang.upper()} ASR — Evaluation ===")
+    print(f"  Model    : {model_dir_or_id}")
+    print(f"  Manifest : {manifest_path}")
 
-    # Load model
-    model, processor = FastLanguageModel.from_pretrained(
-        model_name=model_dir_or_id,
-        max_seq_length=512,
-        dtype=None,
-        load_in_4bit=False,
+    # ── load model + processor ──
+    hf_token = os.environ.get("HUGGINGFACE_TOKEN")
+    processor = WhisperProcessor.from_pretrained(model_dir_or_id, token=hf_token)
+    model = WhisperForConditionalGeneration.from_pretrained(
+        model_dir_or_id, token=hf_token
     )
-    FastLanguageModel.for_inference(model)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
 
-    text_tokenizer = (
-        getattr(processor, "tokenizer", None)
-        or getattr(processor, "text_tokenizer", None)
-        or processor
+    model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(
+        language="sw", task="transcribe"
     )
-    if text_tokenizer.pad_token_id is None:
-        text_tokenizer.pad_token = text_tokenizer.eos_token
-    model.config.pad_token_id = text_tokenizer.pad_token_id
-    text_tokenizer.padding_side = "left"
 
-    terminators = []
-    for tok in [
-        text_tokenizer.eos_token_id,
-        text_tokenizer.convert_tokens_to_ids("<end_of_turn>"),
-        text_tokenizer.convert_tokens_to_ids("<eos>"),
-    ]:
-        if isinstance(tok, int) and tok >= 0 and tok not in terminators:
-            terminators.append(tok)
+    # ── load eval manifest ──
+    records = []
+    with open(manifest_path, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
 
-    # Load eval pairs
-    pairs = load_eval_pairs(eval_file)
     if n_samples:
         import random; random.seed(42)
-        pairs = random.sample(pairs, min(n_samples, len(pairs)))
-    print(f"  Evaluating on {len(pairs)} pairs...\n")
+        records = random.sample(records, min(n_samples, len(records)))
 
-    references, hypotheses, sample_output = [], [], []
+    print(f"  Evaluating {len(records)} clips...\n")
 
-    for i, pair in enumerate(pairs):
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "source_lang_code": src_lang,
-                        "target_lang_code": tgt_lang,
-                        "text": pair["english"],
-                    }
-                ],
-            }
-        ]
-        formatted = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-        inputs = text_tokenizer([formatted], return_tensors="pt", padding=True)
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    predictions, references, sample_output = [], [], []
+
+    for i, record in enumerate(records):
+        text_ref = record.get("text", "").strip()
+        if not text_ref:
+            continue
+
+        try:
+            audio, sr = sf.read(record["audio_path"], dtype="float32")
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1)
+            if sr != 16000:
+                audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        except Exception as e:
+            print(f"  [skip] {record['audio_path']}: {e}")
+            continue
+
+        inputs = processor.feature_extractor(
+            audio, sampling_rate=16000, return_tensors="pt"
+        ).input_features.to(device)
 
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                do_sample=False,
-                eos_token_id=terminators,
-                pad_token_id=text_tokenizer.pad_token_id,
-            )
+            predicted_ids = model.generate(inputs, max_new_tokens=225)
 
-        input_len = inputs["input_ids"].shape[1]
-        pred = text_tokenizer.decode(
-            outputs[0][input_len:], skip_special_tokens=True
-        ).strip()
+        pred_text = processor.tokenizer.batch_decode(
+            predicted_ids, skip_special_tokens=True
+        )[0].strip()
 
-        references.append(pair["luhya"])
-        hypotheses.append(pred)
+        predictions.append(pred_text)
+        references.append(text_ref)
 
-        if i < 10:
+        if i < 15:
             sample_output.append({
-                "english":   pair["english"],
-                "reference": pair["luhya"],
-                "predicted": pred,
-                "dialect":   pair.get("dialect", "?"),
+                "reference":  text_ref,
+                "predicted":  pred_text,
+                "dialect":    record.get("dialect", "?"),
+                "source":     record.get("source", "?"),
+                "duration_s": record.get("duration_s", 0),
             })
 
         if (i + 1) % 50 == 0:
-            print(f"  ... {i+1}/{len(pairs)}")
+            print(f"  ... {i+1}/{len(records)}")
 
-    # Compute metrics
-    bleu_score = sacrebleu.corpus_bleu(hypotheses, [references])
-    chrf_score = sacrebleu.corpus_chrf(hypotheses, [references], beta=2)
-
-    # Parse eval_loss from training checkpoints
+    # ── compute metrics ──
+    metrics = compute_wer_cer(predictions, references)
     eval_loss_data = parse_eval_loss(checkpoint_dir)
 
     results = {
-        "model": model_dir_or_id,
-        "eval_pairs": len(pairs),
-        "BLEU":   round(bleu_score.score, 4),
-        "chrF++": round(chrf_score.score, 4),
-        **eval_loss_data,            # merges best_eval_loss, perplexity, history, etc.
-        "samples": sample_output,
+        "model":     model_dir_or_id,
+        "language":  lang,
+        "n_clips":   len(predictions),
+        **metrics,
+        **eval_loss_data,
+        "samples":   sample_output,
     }
 
-    print(f"\n{'='*40}")
-    print(f"  BLEU        : {results['BLEU']}")
-    print(f"  chrF++      : {results['chrF++']}")
+    print(f"\n{'='*42}")
+    print(f"  WER         : {metrics['WER']}%")
+    print(f"  CER         : {metrics['CER']}%")
     if "best_eval_loss" in results:
-        print(f"  eval_loss   : {results['best_eval_loss']}  (best at step {results.get('best_step','?')})")
+        print(f"  eval_loss   : {results['best_eval_loss']}  (step {results.get('best_step','?')})")
         print(f"  perplexity  : {results['perplexity']}")
-        print(f"  final loss  : {results.get('final_eval_loss', 'n/a')}")
-    elif "eval_loss_note" in results:
-        print(f"  eval_loss   : {results['eval_loss_note']}")
-    print(f"{'='*40}\n")
+    print(f"{'='*42}\n")
 
-    print("Sample translations:")
+    # ── WER interpretation ──
+    wer = metrics["WER"]
+    if wer < 25:
+        tier = "Excellent — production-grade for controlled domains"
+    elif wer < 40:
+        tier = "Good — usable with post-processing / language model rescoring"
+    elif wer < 55:
+        tier = "Fair — useful for assisted transcription, needs more data"
+    else:
+        tier = "Needs improvement — gather more audio or review pseudo-labels"
+    print(f"  Assessment  : {tier}\n")
+
+    print("Sample predictions:")
     for s in sample_output[:5]:
-        print(f"  EN  : {s['english']}")
-        print(f"  REF : {s['reference']}  [{s['dialect']}]")
-        print(f"  PRED: {s['predicted']}")
+        print(f"  REF : {s['reference']}")
+        print(f"  PRED: {s['predicted']}  [{s['dialect']}]")
         print()
 
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"Results saved → {output_file}")
-
     return results
 
 
+# ── entry point ───────────────────────────────────────────────────────────────
+import os
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir",       default=None, help="Local path to merged model or LoRA adapter")
-    parser.add_argument("--model-id",        default=None, help="HuggingFace Hub model ID")
-    parser.add_argument("--eval-file",       default="data/processed/eval.jsonl")
-    parser.add_argument("--output",          default="evaluation/results.json")
-    parser.add_argument("--n-samples",       type=int, default=None, help="Limit eval set size")
-    parser.add_argument("--checkpoint-dir",  default="training/checkpoints",
-                        help="TRL checkpoint directory containing trainer_state.json "
-                             "(used to parse eval_loss history). Defaults to training/checkpoints.")
+    parser.add_argument("--lang",            required=True, choices=["luhya", "gusii"])
+    parser.add_argument("--model-dir",       default=None)
+    parser.add_argument("--model-id",        default=None)
+    parser.add_argument("--manifest",        default=None,
+                        help="Override default manifest path")
+    parser.add_argument("--checkpoint-dir",  default=None,
+                        help="Training checkpoint dir for eval_loss parsing")
+    parser.add_argument("--output",          default=None)
+    parser.add_argument("--n-samples",       type=int, default=None)
     args = parser.parse_args()
+
+    base = Path(__file__).parent.parent
 
     model_ref = args.model_dir or args.model_id
     if not model_ref:
         raise ValueError("Provide --model-dir or --model-id")
 
-    base = Path(__file__).parent.parent
+    manifest = args.manifest or str(
+        base / f"data/processed/{args.lang}/manifest_eval.jsonl"
+    )
+    output   = args.output or str(
+        base / f"evaluation/{args.lang}_results.json"
+    )
+    ckpt_dir = args.checkpoint_dir or str(
+        base / f"training/{args.lang}/checkpoints"
+    )
+
     run_evaluation(
         model_dir_or_id=model_ref,
-        eval_file=str(base / args.eval_file),
-        output_file=str(base / args.output),
+        manifest_path=manifest,
+        output_file=output,
+        checkpoint_dir=ckpt_dir,
         n_samples=args.n_samples,
-        checkpoint_dir=str(base / args.checkpoint_dir),
+        lang=args.lang,
     )
